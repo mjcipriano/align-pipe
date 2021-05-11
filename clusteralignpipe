@@ -1,0 +1,138 @@
+#!/usr/bin/perl
+
+
+use strict;
+use Getopt::Long;
+use Mbl;
+
+my $gmoddb = undef;
+my $organism = undef;
+my $blastdb = undef;
+my $evalue = 1e-9;
+my $orflist_file = undef;
+my $dir = undef;
+my $dbfile = undef;
+my $run = undef;
+
+my $args = 	GetOptions(	"gmoddb=s", \$gmoddb,
+				"blastdb=s", \$blastdb,
+				"evalue=s", \$evalue,
+				"organism=s", \$organism,
+				"orf_list=s", \$orflist_file,
+				"outputdir=s",\$dir,
+				"dbfile=s", \$dbfile,
+				"run=s", \$run
+		);
+
+print "
+gmoddb=$gmoddb
+blastdb=$blastdb
+evalue=$evalue
+organism=$organism
+orflist=$orflist_file
+run=$run
+";
+if(!defined($gmoddb) || !defined($blastdb) || !defined($evalue) || !defined($organism) || !defined($dir) || !defined($run) )
+{
+	print "Exiting, error in options\n";
+	print 'Options:
+--gmoddb                The GMOD database that contains the orf sequences and will store the results.
+--blastdb               The name of the blast database that will be queried against.
+--orf_list              The file containing the list of orfs that you wish to process from the GMODDB.
+--evalue                The evalue cut-off to a apply to a match (default 1e-10).
+--organism		The name of the organism.
+--outputdir             The directory to output the files that get created (alignment, tree) (This directory must exist).
+--dbfile		The name of the database configuration file with the username, host, and password.
+--run			One of either all, tocluster, fromcluster or tocluster-fromcluster
+
+Example: ./cluster_alignpipe --gmoddb=giardia --blastdb=RefEuks --evalue=1e-9 --organism="giardia lamblia" --outputdir=/home/project/align
+
+';
+	exit;
+}
+
+my $mbl = Mbl::new(undef, $gmoddb);
+my $dbh = $mbl->dbh;
+
+# Get the orfs that have blast hits above a certain evalue from a particular database and set those up to be part of the pipeline
+my $sequence_type_id = $mbl->get_sequence_type_id("orf");
+my $db_id = $mbl->get_db_id($blastdb);
+my $getorfs_h = $dbh->prepare("select distinct idname from blast_results where sequence_type_id = ? AND db = ? AND evalue < ?");
+my @orflist;
+
+
+
+if($orflist_file)
+{
+	open(ORFLIST, $orflist_file);
+	while(<ORFLIST>)
+	{
+		my $line = $_;
+		chomp($line);
+		push(@orflist, $line);
+	}
+} else
+{
+	$getorfs_h->execute($sequence_type_id, $db_id, $evalue);
+	while(my $row = $getorfs_h->fetchrow_hashref)
+	{
+		push(@orflist, $row->{idname});
+	}
+}
+
+foreach my $orfid (@orflist)
+{
+	print "Creating script for " . $orfid . "\n";
+
+	if(
+#	my $command = 	"/xraid/bioware/linux/mbl-align-pipe/alignpipe" .
+#			" --gmoddb=$gmoddb --blastdb=$blastdb --storefile --storedb --run=all --outputdir=$dir/$orfid --orf_number=$orfid --verbose --noprompt --organism='$organism' --mb=mb";
+
+	my $command = '';
+	if($run eq 'all')
+	{
+		$command = 	"/xraid/bioware/linux/mbl-align-pipe/alignpipe" .
+			" --gmoddb=$gmoddb --blastdb=$blastdb --storefile --storedb --run=all --outputdir=$dir/$orfid --orf_number=$orfid --verbose --noprompt --organism='$organism' --mb=mb";
+	} elsif($run eq 'tocluster')
+	{
+		$command = 	"/xraid/bioware/linux/mbl-align-pipe/alignpipe" .
+			" --gmoddb=$gmoddb --blastdb=$blastdb --storefile --storedb --run=tocluster --outputdir=$dir/$orfid --orf_number=$orfid --verbose --noprompt --organism='$organism' --mb=mb";
+	} elsif($run eq 'fromcluster')
+	{ 
+
+		$command = 	"/xraid/bioware/linux/mbl-align-pipe/alignpipe" .
+			" --gmoddb=$gmoddb --blastdb=$blastdb --storefile --storedb --run=fromcluster --outputdir=$dir/$orfid --orf_number=$orfid --verbose --noprompt --organism='$organism' --mb=mb";
+	} elsif($run eq 'tocluster-fromcluster')
+	{
+		$command = 	"/xraid/bioware/linux/mbl-align-pipe/alignpipe" .
+			" --gmoddb=$gmoddb --blastdb=$blastdb --storefile --storedb --run=tocluster --outputdir=$dir/$orfid --orf_number=$orfid --verbose --noprompt --organism='$organism' --mb=mb";
+		$command .= 	"/xraid/bioware/linux/mbl-align-pipe/alignpipe\n"
+			" --gmoddb=$gmoddb --blastdb=$blastdb --storefile --storedb --run=fromcluster --outputdir=$dir/$orfid --orf_number=$orfid --verbose --noprompt --organism='$organism' --mb=mb";
+
+	}
+
+	# Delete then Create the directories needed - Currently, don't delete though
+	mkdir("$dir/$orfid");
+
+	# Create cluster submit file
+	my $script_file = $dir . "/" . $gmoddb . "_" . $orfid .".sh";
+	open(SUBMIT, ">", $script_file);
+	print SUBMIT  
+'#!/bin/csh
+#$ -j y
+#$ -o ' . "$dir/$orfid" . '/log.out' . "\n" .
+'#$ -N ap_' . $orfid . '
+#$ -cwd
+ 
+setenv PERL5LIB /usr/lib64/perl5:/usr/lib/perl5:/xraid/bioware/gmod/gmod-perllib:/xraid/bioware/linux/Perl/lib/perl5
+setenv MBLPIPE_DBFILE ' . $dbfile . '
+cd ' . $dir . "\n" .
+$command . "\n" .
+
+close(SUBMIT);
+# Submit this
+system("qsub $script_file");
+	
+}
+
+

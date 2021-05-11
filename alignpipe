@@ -1,0 +1,2308 @@
+#!/usr/bin/perl
+
+=head1 NAME
+
+alignpipe  -- This script will create alignments and trees...
+
+=head1 SYNOPSIS
+
+        This script uses BLAST results to locate comparative sequences for an open reading frame, 
+	then uses MUSCLE on the top hits to create an alignment.  This alignment
+	is iteratively run through Mr.Bayes and a masking process to develop
+	an optimized phylogenetic tree for comparative evolution.
+
+=head1 DESCRIPTION
+
+	The logical steps for alignpipe are as follows:
+	1) Read in commandline arguments (see OPTIONS below)
+	2) Get BLAST results
+		a) read from the database containing blast_results
+		b) or blastp orf_fasta against blastdb
+		c) or read from an alignment file
+	3) Get an alignment
+		a) Run Muscle on the set of blast sequences
+	4) Create an initial mask of the alignment data 
+	5) Iterate tree generation
+		a) Run Mr.Bayes on the alignment data
+		b) Determine the confidence level of the consensus tree
+		c) Compare confidence with acceptable confidence
+		d) Update the masking parameters
+		e) repeat...
+	6) Store the results to the database or an output file
+
+=head1 INSTALLATION
+
+This is how I install the script...
+
+=head1 REQUIREMENTS
+
+ The following perl modules are needed for this script.
+
+  Mbl
+  Bio::Seq
+  Bio::AlignIO
+  Bio::Tools::Run::Alignment::Muscle
+  Bio::Tools::Run::StandAloneBlast
+  Bio::TreeIO::nexus
+  Getopt::Long
+  File::Temp
+
+ The following programs must be in your path.
+  muscle
+  blastall
+  fastacmd
+
+
+=head1 AUTHOR
+
+ Michael Cipriano <mcipriano@mbl.edu>
+ Susan Huse       <shuse@mbl.edu>
+ Andrew McArthur  <amcarthur@mbl.edu>
+
+ This is free software; you can redistribute it and/or modify
+it under the same terms as Perl itself.
+
+
+=cut
+
+use strict;
+use Mbl;
+use IO::String;
+use Bio::Seq;
+use Bio::SeqIO;
+use Bio::AlignIO;
+use Bio::Tools::Run::Alignment::Muscle;
+use Bio::Tools::Run::StandAloneBlast;
+use Bio::TreeIO::nexus;
+use Getopt::Long;
+use File::Temp qw/ tempfile tempdir /;
+
+#################################################
+#
+# Arguments that may optionally be set by the user
+#
+#################################################
+
+#Run parameters - set default values if appropriate, that can be altered by user settings
+my $config_file = undef; #option to put all config info into a file rather than on commandline
+
+my $organism = undef; #organism whose orfs these are
+my $query_genus = "Giardia";
+my $query_species = "lamblia";
+
+my $run = undef;  #run tocluster, fromcluster or all
+my $gmoddb = undef; #what is the database source of orf information and destination of saved data
+my $blastdb = undef; #database to blast against (unless gmoddb has precompiled results
+my $orf_number = undef; #a single orf to analyze
+my $orf_list = undef; # a text file list of orfs, one number per line
+my $orf_fasta = undef; #a fasta source file for the orf sequence data
+my $alignment_input = undef; #can start with existing alignment file rather than blast and align
+my $alignment_type = "nexus"; #alignment file type
+my $verbose = 0; #run with verbose information to the screen
+my $storedb = 1; #store alignments and trees back into the gmoddb
+my $storefile = 1; #store alignment file to disk
+my $prompt = 0; #prompt existing data, if 0 will prompt
+my $appendlogs = 1; #append rather than prompt existing .log, .align, .score files
+
+my $cwd = `pwd`; 
+chomp($cwd);
+my $outputdir = $cwd; #write data to current directory
+
+# Alignment and mrbayes run parameters
+my $evalue = 1e-10; #minimum value for keeping blast results
+my $hits_per_org = 1;  #maximum number of hits per organism to be included in the alignment
+my $mb = "runmb3"; #cluster command to invoke mrbayes
+my $ngens = 500000; #mb ngens (2000 for testing)
+my $burnin = 50; #mb burnin (20 for testing)
+my $mask = undef; #mask string for mb
+
+#Quality testing parameters - set default values if appropriate, that can be altered by user settings
+my $min_orgs_align = 6;  #minimum number of organisms needed in the alignment to make it worthwhile
+my $max_ratio_of_alignment = 2;  #alignment should not be more than 2X orf length
+my $min_score = 6;  #minimum tree score to save tree to the database
+my $min_length_masked = 75; #minimum alignment length that is not masked out needed to run mb
+
+
+#################################################
+#
+# Other variable declarations
+#
+#################################################
+
+#ORF accounting variables
+my $orfid;
+my %orfs_hash;
+my $sequences_hash;
+
+#Organism parameters
+my $orf_seq = undef;
+
+#Run parameters
+my $tocluster;
+my $fromcluster;
+my $toclusteronly;
+my $fromclusteronly;
+
+#File names -- values completed after commandline processing
+my $run_log_file;
+my $aln_log_file;
+my $score_log_file;
+
+my $blast_file;
+my $muscle_logfile;
+my $muscle_scorefile;
+my $muscle_outfile;
+my $alignment_infile;
+my $alignment_file;
+my $bayes_infile;
+my $bayes_infile1;
+my $bayes_infile2;
+my $bayes_outfile;
+my $cluster_file;
+my $consensus_file;
+my $atv_file;
+my $treedir;
+my $seqpm_file;
+
+# Muscle and masking parameters
+my $anchor_size = 100; 
+my $low_score = 15; 
+my $num_steps = 7;
+my $low_score_increment = 5;
+
+#Alignment parameters
+my $alignment;
+my $seq_num;
+my $orf_length;
+my $alignment_length;
+my $include_length;
+my $treeio;
+#my $mask;
+my $alignment_description = "BLASTP alignment against RefEuks database";
+my $align_id;
+
+#Tree parameters
+my $tree_description = "Consensus tree against RefEuks database";
+my $tree_type = "newick";
+
+
+############################################
+# 
+# Parse the commandline parameters and test for validity
+#
+############################################
+my $runcommand = "$0 @ARGV\n";
+if ((! $ARGV[0]) || ($ARGV[0] eq "--help")) 
+{
+	print_usage();
+}
+my $args = GetOptions(	
+			"configuration=s" => \$config_file,
+			"organism=s" => \$organism,
+			"run=s"		=> \$run,
+			"gmoddb=s"	=> \$gmoddb,
+			"blastdb=s"	=> \$blastdb,
+			"orf_number=s"	=> \$orf_number,
+			"orf_list=s" => \$orf_list,
+			"orf_fasta=s"	=> \$orf_fasta,
+			"evalue=s"	=> \$evalue,
+			"alignment_input=s"	=> \$alignment_input,
+			"alignment_type=s"=> \$alignment_type,
+			"storedb!"	=> \$storedb,
+			"storefile!"	=> \$storefile,
+			"outputdir=s"	=> \$outputdir,
+			"prompt!"   => \$prompt,
+			"verbose!"		=> \$verbose,
+			"append!"  => \$appendlogs,
+			"mb=s"     => \$mb,
+			"ngens=s"  => \$ngens,
+			"burnin=s" => \$burnin,
+			"mask=s"  => \$mask,
+			"min_orgs=s" => \$min_orgs_align,
+			"max_ratio=s" => \$max_ratio_of_alignment,
+			"min_length=s" => \$min_length_masked,
+		);
+
+# Check for an input configuration file, and just use that.  Ignore everything else.
+if (defined($config_file)) 
+{
+	if (! -f $config_file) 
+	{ 
+		print "Unable to read configuration file: $config_file.  Please try again.\n";
+		exit 0;
+	} else {
+		open (CONFIG, "<$config_file") or die("Unable to read configuration file: $config_file.  Please try again.\n");
+		while(<CONFIG>) 
+		{
+			chomp;
+			s/#.*//;	#remove comments
+			s/^\s+//;	#remove leading white space
+			s/\s+$//;	#remove trailing white space
+			s/"//g;     #remove any quotation marks
+			next unless length;
+			my ($var, $value) = split(/\s*=\s*/, $_, 2);
+			eval "\$$var=\"$value\";\n";
+		}
+		close(CONFIG);
+	}
+}
+
+if ($organism) {
+	($query_genus, $query_species) = split ( " ", $organism);
+	$query_genus = ucfirst lc $query_genus;
+	$query_species = lc $query_species;
+}
+
+# Set defaults if they were not set
+
+
+if($verbose)
+{
+	print "
+             Selected Options
+             ----------------
+       configuration: $config_file
+                 run: $run
+            organism: $organism
+              gmoddb: $gmoddb
+             blastdb: $blastdb
+          orf_number: $orf_number
+            orf_list: $orf_list
+           orf_fasta: $orf_fasta
+              evalue: $evalue
+     alignment_input: $alignment_input
+      alignment_type: $alignment_type
+             storedb: $storedb
+           storefile: $storefile
+           outputdir: $outputdir
+              prompt: $prompt
+          appendlogs: $appendlogs
+             verbose: $verbose
+                  mb: $mb
+               ngens: $ngens
+              burnin: $burnin
+            min_orgs: $min_orgs_align
+           max_ratio: $max_ratio_of_alignment
+          min_length: $min_length_masked
+";
+}
+
+sub print_usage 
+{
+	my $usage_statement = 
+
+"alignpipe takes one or more ORF sequences, uses BLAST to find comparable sequences, aligns the top hits using muscle.  The alignment is then masked and run through Mr.Bayes to develop a consensus tree for comparative evolution.
+
+The following parameters may be used on the command line, or included in a configuration file.
+
+  --run           Whether to 1) run the entire pipeline, 2) run the BLAST and alignment 
+                     routines and create mrbayes files for the cluster, or 3) process 
+                     mrbayes cluster results, and test the tree for phylogeny.
+                     (all, tocluster, fromcluster)
+
+  --configuration  Provide all parameters in a configuration file.  When specified in 
+                     a file, do not use \"--\"  just set param=value (e.g., run=all)
+                     Commented information (#) is ignored.
+                     Commandline parameters used with a configuration file take precedence.
+  --verbose        To print verbose output to the screen
+
+  --gmoddb         The GMOD database that contains the orf sequences and will store the results, 
+				     use either a GMOD database or a fasta file.
+  --orf_fasta      The file which contains the orf you wish to process (use if not using GMODDB)
+                     If no orf_number or orf_list is specified, alignpipe will run on
+                     all ORFs in the file.
+
+  --orf_number     The orf that you wish to process from the GMODDB. If running with an 
+                      alignment input, use this to set an identification number (gi number
+                      or other accession number if necessary).
+                      Orf_number cannot be used with --orf_list
+  --orf_list       The file containing the list of orfs that you wish to process from the GMODDB, 
+                     cannot be used with --orf_number
+
+  --outputdir      The directory to output the subdirectories and files that get created 
+
+  --blastdb        The name of the blast database that will be queried against
+  --evalue         The evalue cut-off to apply to a match (default 1e-10)
+
+  --alignment_input Optionally, provide the alignment to start with rather then creating a new one
+  --alignment_type The file type of the alignment if provided 
+                     (bl2seq, fasta, nexus, clustax, maf, phylp, meme, msf, mega, 
+                     stockholm, prodom, emboss, mase).  Default is nexus.
+
+  --storedb        If given, will store the results in the GMODDB database. (default enabled)
+  --storefile      If given, will store the results to files in a directory that will be created 
+                     in your run directory. (default enabled)
+";
+
+
+	print "\n$usage_statement\n\n";
+	print "Type \"perldoc alignpipe\" for more information about the program\n";
+	exit 0;
+}
+
+
+# If the default options are not provided then print the options and exit
+my $options_set=1;
+
+if (!defined($run)) { print "Mandatory parameter: \"run\" not set\n"; $options_set=0;}
+if (( length($query_genus) < 1) || (length($query_species) < 1)) { print "Unable to parse genus and species from organism\n"; $options_set=0;}
+if ($run ne "fromcluster" &&  !defined($blastdb)) {print "Mandatory parameter blastdb not set\n"; $options_set=0;}
+if ($run ne "fromcluster" && (!defined($orf_fasta) && !defined($gmoddb) && !defined($alignment_input))) {print "Mandatory parameter orf data or alignment source not set\n"; $options_set=0;}
+#if ( ($storedb) && !defined($gmoddb)) { print "Mandatory parameter not set, must set gmoddb to use storedb option.\n"; $options_set=0;} 
+if ( !defined($orf_number) && !defined($orf_list) && !defined($orf_fasta) ) {print "Mandatory set of orf numbers not set\n"; $options_set=0;}
+if ((defined $alignment_input) && (!defined $orf_number)) {print "Alignment input must have an identification number (\$orfnumber)\n";; $options_set=0;}
+
+#if( (!defined($gmoddb) || !defined($blastdb) || !defined($orf_number)) && (!defined($gmoddb) || !defined($blastdb) || !defined($orf_list)) && ( !defined($alignment_input) || !defined($alignment_type) || !defined($orf_number) ) && (!defined($orf_fasta) || !defined($blastdb)) || (($orf_number) && ($orf_list)) )
+
+if (! $options_set) 
+{
+	print 
+<<ENDPRINT
+You did not supply the correct options. 
+--gmoddb		The GMOD database that contains the orf sequences and will store the results
+--blastdb		The name of the blast database that will be queried against
+--orf_number			The orf that you wish to process from the GMODDB, cannot be used with --orf_list
+--orf_list		The file containing the list of orfs that you wish to process from the GMODDB, cannot be used with --orf_number
+--orf_fasta		The file which contains the orf you wish to process in fasta format (use if not using GMODDB)
+--evalue		The evalue cut-off to a apply to a match (default 1e-10)
+--alignment		Optionally, you may provide an alignment file to start off with rather then create one
+--alignment_type	The file type of the alignment if provided 
+			(bl2seq, fasta, nexus, clustax, maf, phylp, meme, msf, mega, stockholm, prodom, emboss, mase)
+--storedb		If given, will store the results in the GMODDB database. (default disabled)
+--nostoredb		If given, will not store the results in the GMODDB database (default enabled)
+--storefile		If given, will store the results to files in a directory that will be created in your run directory. (default enabled)
+--nostorefile		If given, will not store any results to a file. (default disabled)
+--outputdir		The directory to output the files that get created (alignment, tree) (default is current working directory)
+--verbose			To print verbose output to the screen
+
+Examples:  
+  ./alignpipe --gmoddb=giardia12 --blastdb=RefEuks --orf_number=5434 --storedb --nostorefile
+    Using the giardia12 GMODDB and orf number 5434, create a tree with the results 
+    of similarities to the RefEuks database and store the results in the database.
+
+  ./alignpipe --orf_fasta=myorf.fasta --blastdb=RefEuks --evalue=1e-3 --storefile --outputdir=testdir
+    Using the myorf.fasta orf, blast it to the RefEuks database and obtain all hits with an evalue of 1e-3
+    and create a tree and store the results the alignment and tree to a file in testdir.
+
+ENDPRINT
+;
+	exit 0;
+}
+
+if (($run ne "all") && ($run ne "tocluster") && ($run ne "fromcluster")) {
+	print "Mandatory parameter \"run\" must be \"all\", \"tocluster\" or \"fromcluster\"\n";
+	exit 0;
+} elsif ($run eq "all") 
+{
+	$tocluster = 1;
+	$fromcluster = 1;
+	$toclusteronly = 0;
+	$fromclusteronly = 0;
+} elsif ($run eq "tocluster")
+{
+	$tocluster = 1;
+	$fromcluster = 0;
+	$toclusteronly = 1;
+	$fromclusteronly = 0;
+} elsif ($run eq "fromcluster") 
+{
+	$tocluster = 0;
+	$fromcluster = 1;
+	$toclusteronly = 0;
+	$fromclusteronly = 1;
+}
+
+if (($run eq "all") && ($prompt)) {
+	my $answer;
+	print "\nIf you are not currently on the cluster, this could take a long time!  Proceed?\n";
+	$answer = <>;
+	if ($answer !~ /^[Yy]/) 
+	{
+		print "Exiting...\n"; 
+		print "Error:  run on non-cluster machine aborted.\n";
+		exit 0;
+	}
+}
+
+if (($storedb) && (!$gmoddb)) {$storedb = 0;}
+
+###################################################
+#
+# Determine the list of orfs and create outer loop foreach $orfid
+# Error check these files before proceeding
+#
+##################################################
+#Read in list of orfs from fasta or simple list
+
+if ($orf_number) 
+{
+	$orfs_hash{$orf_number}++;
+	if($verbose) { print "Using Orfid $orf_number\n"; }
+} elsif ($orf_list) 
+{
+	if (! -f $orf_list) {
+		print "Error: unable to locate orf list $orf_list.   Exiting...\n";
+		exit 0;
+	}
+	open (ORFS, "<$orf_list");
+	while (<ORFS>) 
+	{
+		my $line = $_;
+		chomp($line);
+		($orfid) = split(/\s/,$line);
+		($orfid) = split(/\|/, $orfid);
+		$orfid =~ s/>//g;
+		$orfs_hash{$orfid}++;
+	}
+	if($verbose) { print "Using orf list file \"$orf_list\"\n"; }
+} elsif (defined $alignment_input) 
+{
+	if (! -f $alignment_input) 
+	{
+		print "Error:  unable to locate alignment file $alignment_input.  Exiting...\n";
+		exit 0;
+	}
+}
+
+# If using --orf_number or --orf_list, only load those from the orf_fasta file
+if ($orf_fasta) 
+{ 
+	my $in = Bio::SeqIO->new( -file=>$orf_fasta, -format=>'fasta');
+	while (my $orf_seq = $in->next_seq())
+	{
+		$orfid = $orf_seq->id;
+
+		$orfid =~ s/\D*(\d+).*$/$1/;
+		#print "Orf ID: $orfid\n";
+		if (((! $orf_list) && (! $orf_number)) || ($orfs_hash{$orfid}))
+		{
+			#If there isn't a list or number, then use all in the fasta file
+			#If there is a list or number, then only load the sequence for those ids
+			$orfs_hash{$orfid} = $orf_seq;
+		}
+	}
+
+	if($verbose) { print "Using Orf fasta file \"$orf_fasta\"\n"; }
+}
+if ( ! %orfs_hash ) 
+{
+	print "No orfs found for analysis.  Exiting...\n";
+	exit 0;
+} else
+{
+	if ($verbose) {print "Running alignpipe on " . (scalar keys %orfs_hash) . " orfs.\n";}
+}
+
+
+###################################################
+#
+# Set the output directories alignment, mbruns, trees
+#  Check for necessary files, etc
+#
+###################################################
+$outputdir =~ s/\/$//;
+if (! -d $outputdir) 
+{
+	if ($prompt) {
+		my $answer;
+		print "Create output directory: \"$outputdir\"?\n";
+		$answer = <>; 
+		if ($answer =~ /y|Y/) {
+			`mkdir $outputdir`;
+		} else {
+			print "Unable to continue without valid output directory.  Exiting...\n";
+			exit 0;
+		}
+	} else {
+		`mkdir $outputdir`;
+	}
+		
+} elsif ($prompt) {
+	my $answer;
+	print "Overwrite existing data in directory: \"$outputdir\"?\n";
+	$answer = <>;
+	if ($answer !~ /^[yY]/)
+	{
+		print "Please try again with a new output directory.  Exiting...\n";
+		print "Error:  invalid output directory.\n";
+		exit 0;
+	}
+}
+
+if (! -d "$outputdir/blast") 
+{
+	`mkdir "$outputdir/blast"`;
+}
+if (! -d "$outputdir/muscle") 
+{
+	`mkdir "$outputdir/muscle"`;
+}
+if (! -d "$outputdir/alignments") 
+{
+	`mkdir "$outputdir/alignments"`;
+}
+if (! -d "$outputdir/mbruns") 
+{
+	`mkdir "$outputdir/mbruns"`;
+}
+if (! -d "$outputdir/trees") 
+{
+	`mkdir "$outputdir/trees"`;
+}
+
+# Set directory and cluster file
+$run_log_file = "$outputdir/alignpipe.log";
+$aln_log_file = "$outputdir/alignpipe.align";
+$score_log_file = "$outputdir/alignpipe.score";
+$cluster_file = "$outputdir/cluster_run";
+$treedir = "$outputdir/trees";
+
+if (($toclusteronly) && (-f $cluster_file))
+{ 
+	#remove file so can append to it cleanly
+	`rm $cluster_file`;
+}
+
+#
+# Set up the log and scoring files
+#
+if ($tocluster) {
+	if ($appendlogs) 
+	{
+		if (! -f  $aln_log_file) {
+			open (ALIGNLOG, ">>$aln_log_file");
+			print ALIGNLOG "Orf_id\tNum_Seq\tOrf_len\tAln_len\tIncl_len\n";
+		} else {
+			open (ALIGNLOG, ">>$aln_log_file");
+		}
+	} else {
+		open (ALIGNLOG, ">$aln_log_file");
+		print ALIGNLOG "Orf_id\tNum_Seq\tOrf_len\tAln_len\tIncl_len\n";
+	}
+}
+
+if ($fromcluster) {
+	if ($appendlogs) 
+	{
+		if (! -f  $score_log_file) {
+			open (SCORELOG, ">>$score_log_file");
+			print SCORELOG "Orf_id\tScore\n";
+		} else {
+			open (SCORELOG, ">>$score_log_file");
+		}
+	} else {
+		open (SCORELOG, ">$score_log_file");
+		print SCORELOG "Orf_id\tScore\n";
+	}
+}
+
+open (RUNLOG, ">>$run_log_file");
+print RUNLOG "\n\n==============================================================\n";
+my $date_string = localtime;
+print RUNLOG "$date_string\n";
+print RUNLOG "$runcommand\n";
+
+# Set up for connection to the database if $gmoddb
+my $mbl;
+my $dbh;
+
+if (($gmoddb) && ( ($tocluster) ||($storedb) ))
+{
+	# Create an MBL object
+	$mbl = Mbl::new(undef, $gmoddb);
+	$dbh = $mbl->dbh();
+}
+
+
+# TODO:  DO NOT CLEAN UP UNTIL SCRIPT IS COMPLETE. SWITCH THIS FOR ABOVE AFTER TESTING
+my $temp_dir;
+$temp_dir = tempdir( CLEANUP => 1 );
+if($verbose) 
+{ 
+	print "Temporary directory: $temp_dir\n"; 
+	print RUNLOG "Temporary directory: $temp_dir\n"; 
+} 
+
+###################################################
+###################################################
+#
+# Start the loop for each orf 
+#
+##################################################
+###################################################
+
+foreach $orfid (keys %orfs_hash)
+{
+	if ($verbose) {print "Computing data for orf# $orfid\n";}
+	$sequences_hash = undef; #reset for each orf
+
+	###################################################
+	#
+	# Set orf-specific file names
+	#
+	##################################################
+
+	$blast_file = "$outputdir/blast/$orfid.br";
+	$muscle_logfile = "$outputdir/muscle/$orfid.log";
+	$muscle_scorefile = "$outputdir/muscle/$orfid.score";
+	$muscle_outfile = "$outputdir/muscle/$orfid.out";
+	$alignment_file = "$outputdir/alignments/$orfid.nexus";
+	$bayes_infile = "$outputdir/mbruns/$orfid.mb";
+	$bayes_infile1 = "$outputdir/mbruns/$orfid.mb1";
+	$bayes_infile2 = "$outputdir/mbruns/$orfid.mb2";
+	$bayes_outfile = "$outputdir/trees/$orfid";
+	$consensus_file = "$outputdir/trees/$orfid.con";
+	$atv_file = "$outputdir/trees/$orfid.atv";
+	$seqpm_file = "$outputdir/alignments/$orfid" . "_seq.pm";
+
+	#Alignment parameters
+	undef $alignment;
+	undef $seq_num;
+	undef $orf_length;
+	undef $alignment_length;
+	undef $include_length;
+	undef $treeio;
+	undef $mask;
+
+
+	###################################################
+	#
+	# Get the sequences for alignment, includes blasting if necessary
+	#
+	##################################################
+	if ($tocluster) 
+	{
+		my $orf_seq;
+		if (($gmoddb) && (!defined $alignment_input))
+		{
+			# TODO: fix for from_clusterdb to return only orfid
+			if($verbose) { print "Retrieving blast hits from gmoddb\n"; }
+	
+			$sequences_hash = get_hits_from_db($orfid, $blastdb, $evalue, $dbh);
+		
+			#strip off the orf_seq from $sequences_hash to use in orf_hash below for alignment
+			$orf_seq = pop(@$sequences_hash)->{seqobj};
+			
+		
+		} elsif ($orf_fasta) 
+		{
+			$orf_seq = $orfs_hash{$orfid};
+			if ($orf_seq == 1) {
+				print "No sequence information available in the fasta file $orf_fasta for orf $orfid.  Skipping...\n";
+				print RUNLOG "No sequence information available in the fasta file $orf_fasta for orf $orfid.\n";
+				write_align_log($orfid);
+				clean_files($orfid);
+				next;
+			} 
+			if($verbose) { print "Blasting against $blastdb\n"; }
+			$sequences_hash = get_hits_from_blastdb($orf_seq, $blastdb, $evalue);
+		
+		}
+		if ((!$sequences_hash) && (!defined $alignment_input) )
+		{
+			print "No valid sequences data given for alignment of $orfid.  Skipping...\n";
+			clean_files($orfid);
+			next;
+		}
+		
+		
+		#Add the input orf to the sequence hash, unless alignment file (already has ORF)
+		my $orfseq_hash;
+		if (! $alignment_input) { 
+			$orfseq_hash->{genus} = $query_genus;
+			$orfseq_hash->{species} = $query_species;
+			$orfseq_hash->{evalue} = undef;
+			$orfseq_hash->{seqid} = $orfid . "_" . $query_genus;
+			$orfseq_hash->{seqid_long} = $orfseq_hash->{seqid};
+			$orfseq_hash->{description} = "[$query_genus $query_species] ORF# $orfid";
+			$orf_seq->id($orfid . "_" . $query_genus);
+			$orfseq_hash->{seqobj} = $orf_seq;
+			push(@$sequences_hash, $orfseq_hash);
+		
+			$seq_num = scalar @$sequences_hash;
+			if ($verbose)
+			{
+				print "\nSEQUENCES IN ALIGNMENT\n\n";
+			
+				foreach my $seqobj(@$sequences_hash)
+				{
+					print "SEQID:" . $seqobj->{seqid} . "\n";
+					print "TAXID:" . $seqobj->{taxid} . "\n";
+					print "GENUS:" . $seqobj->{genus} . "\n";
+					print "SPECIES:" . $seqobj->{species} . "\n";
+					print "SOURCE:" . $seqobj->{source} . "\n";
+					print "SEQID_LONG:" . $seqobj->{seqid_long} . "\n";
+					print "DESCRIPTION:" . $seqobj->{description} . "\n";
+					print "EVALUE:" . $seqobj->{evalue} . "\n";
+					print "SEQUENCE:" . $seqobj->{seqobj}->seq() . "\n\n";
+				}
+				print "\n";
+			
+				if ($verbose) {print "$seq_num Sequences to Align.\n";}
+			}
+			
+			if ( $seq_num <= $min_orgs_align )
+			{
+				print "Not enough sequences found for alignment on orf $orfid. Found $seq_num, need $min_orgs_align.  Skipping...\n";
+				print RUNLOG "Not enough sequences found for alignment on orf $orfid.\n";
+				write_align_log($orfid);
+				clean_files($orfid);
+				next;
+			} 
+		}
+		
+		####################################
+		#
+		# Run the alignment and get back the alignment object
+		#
+		####################################
+	
+		#Create the alignment with Muscle
+		if ($alignment_input)
+		{
+			if($verbose) { print "Using alignment file: \"$alignment_input\"\n"; }
+			my $in = Bio::AlignIO->new( -file=>$alignment_input, -format=>$alignment_type);
+			$alignment = $in->next_aln();
+		} else 
+		{
+			$alignment = run_alignment($sequences_hash);
+			if($verbose) { print "created alignment with Muscle\n"; }
+		}
+		if ($storefile) 
+		{
+			my $stored = store_alignment_file($alignment, $alignment_type, $alignment_file);
+			if (! $stored) 
+			{	
+				if ($verbose) {print "Unable to store alignment for orf# $orfid to file $alignment_file.\n"; }
+				print RUNLOG "Unable to store alignment for orf #$orfid to file $alignment_file.\n";
+			}
+				
+		}
+		# Store the results to the database or to a file
+	
+		if($storedb)
+		{
+			if($verbose) {print "Storing the alignment to the database...\n";}
+			$align_id = store_alignment_db($orfid, $alignment, $alignment_type, $alignment_description, $dbh);
+			if (!$align_id) 
+			{	
+				if ($verbose) {print "Unable to store alignment for orf# $orfid to database.\n"; }
+				print RUNLOG "Unable to store alignment for orf# $orfid to database.\n"; 
+			}
+		}
+
+		#test that alignment is long enough relative to the orf
+		if (!defined $alignment_input) {
+			$orf_length = $orf_seq->length;
+		} else {
+			$orf_length = -1;
+		}
+		$alignment_length = $alignment->length;
+		if ($verbose) {print "Alignment length = " . $alignment_length . " and orf length = " . $orf_length . "\n";}
+######
+#		This section removed to include all alignments.
+#
+#		if ($alignment->length > ($max_ratio_of_alignment * $orf_length) ) 
+#		{
+#			if ($verbose) {print "Alignment for $orfid too long relative to orf\n";}
+#			print RUNLOG "Alignment for $orfid too long relative to orf\n";
+#			write_align_log($orfid);
+#			clean_files($orfid);
+#			next;
+#		} 
+	
+		#Create the mask for mb based on Muscle score file
+		if (!defined $alignment_input) {
+			$mask = determine_mask($alignment, $anchor_size, $low_score, $num_steps);
+
+			if (! $mask) 
+			{
+				if ($verbose) {print "Unable to locate valid MUSCLE scorefile \"$muscle_scorefile\".  Skipping...\n";}
+				print RUNLOG "Unable to locate valid MUSCLE scorefile \"$muscle_scorefile\".\n";
+				write_align_log($orfid);
+				clean_files($orfid);
+				next;
+			}
+			if($verbose) { print "created mask in Muscle:\t $mask \n"; }
+			if ($include_length < $min_length_masked) 
+			{
+				if ($verbose) {print "Include length $include_length for $orfid is too short.  Skipping...\n";}
+				print RUNLOG "Include length $include_length for $orfid is too short.\n";
+				write_align_log($orfid);
+				clean_files($orfid);
+				next;
+			}
+		} else {
+			$mask = "";
+		}
+	}
+	
+	##############################################
+	#
+	# Create mb files, optionally run mb
+	#
+	##############################################
+	
+	my $continue = 1;
+	my $trees;
+	my $tree_score_string;
+	
+	if ($tocluster)
+	{
+		#create the .mb1 and .mb2 input mrbayes files
+		#and store the alignment information
+	
+		my @blocks = create_bayes_file($alignment, $mask);
+
+		# Don't use anymore, the sumt (.mb2) is now included with the mcmc in one .mb file
+		#create_consensus_file($alignment);
+
+		if ($storedb) {
+			if ($blocks[0]) {
+				store_alignment_annotation($align_id, $blocks[0], "bayes", $dbh);
+			}
+			if ($blocks[1]) {
+				store_alignment_annotation($align_id, $blocks[1], "mcclade", $dbh);
+			}
+		}
+
+	}
+	
+
+	#
+	# Run mrbayes
+	#
+	if ($run eq "all")
+	{
+		#run mb on both
+		if ($verbose) { print "Begin running mrbayes on $orfid.  Please wait...\n";}
+		print "mb $bayes_infile\n";
+	 	`mb $bayes_infile`;
+
+		#From when mcmc and sumt were separate
+		#print "mb $bayes_infile1\n";
+	 	#`mb $bayes_infile1`;
+		#print "mb $bayes_infile2\n";
+	 	#`mb $bayes_infile2`;
+		if ($verbose) { print "Finished running mrbayes on $orfid.\n";}
+		
+		if (! -f "$consensus_file") 
+		{ 
+			if ($verbose) {print "Error running \"mb $consensus_file\", no output consensus tree written for $orfid.  Skipping...\n";}
+			print RUNLOG "Error running \"mb $consensus_file\", no output consensus tree written for $orfid.\n";
+			write_align_log($orfid);
+			clean_files($orfid);
+			next;
+		} else 
+		{
+			if ($verbose) { print "Created consensus tree with mb\n"; }
+		}
+	
+	} elsif ($toclusteronly)
+	#
+	# Write to the cluster_run script
+	#
+	{
+		`echo "$mb $bayes_infile" >> $cluster_file`;
+		#`echo "$mb $bayes_infile1" >> $cluster_file`;
+		#`echo "$mb $bayes_infile2" >> $cluster_file`;
+		#`echo "clustermb3 $bayes_infile1" >> $cluster_file`;
+		#`echo "clustermb3 $bayes_infile2" >> $cluster_file`;
+	}
+
+
+	##############################################
+	#
+	# Take the mrbayes output and: 
+	#	score the trees, 
+	#	edit seqids to include protein names, and 
+	# 	create newick for ATV
+	#
+	##############################################
+	
+	#
+	#replace sequence ids in the tree consensus file
+	# to be readable, do after mb, because mb crashes on it
+	#
+	if ($toclusteronly)
+	{
+		#Write seqpm_file module
+		my $wrote_seqids = write_seqids($sequences_hash, $seqpm_file);
+		if (!$wrote_seqids) 
+		{
+			if ($verbose) {print "Unable to write sequence id lookup for editing consensus file.\n";}
+			print RUNLOG "Unable to write sequence id lookup for editing consensus file.\n";
+		}
+
+	} elsif ($run eq "all") {
+		replace_sequenceid($sequences_hash, $consensus_file);
+	} else { #fromclusteronly 
+		if ($verbose) {print "Replacing sequence ids in consensus file: $consensus_file.\n";}
+		my $seq_lookup = read_seqids($seqpm_file);
+		if (! $seq_lookup) 
+		{
+			if ($verbose) {print "Unable to retrieve sequence protein lookup information in $seqpm_file.\n";}
+			print RUNLOG "Unable to retrieve sequence protein lookup information in $seqpm_file.\n";
+		}
+		replace_sequenceid($seq_lookup, $consensus_file);
+	}
+	
+	if ($tocluster) 
+	{
+		write_align_log($orfid);
+	}
+
+	if ($fromcluster)
+	{
+		#
+		# Score the trees
+		#
+		if ($verbose) {print "Begin scoring tree $orfid.con\n"};
+		#$trees = create_tree($orfid, $alignment, $mask);
+		$tree_score_string = `treescore -c $consensus_file`;
+		#chomp ($tree_score_string);
+		if ((! defined $tree_score_string) || ($tree_score_string eq ""))
+		{
+			if ($verbose) {print "Error scoring tree for orf $orfid.  No tree scores returned.\n";}
+			print RUNLOG "Error scoring tree for orf $orfid.  No tree scores returned.\n";
+			print SCORELOG "$orfid\n";
+			clean_files($orfid);
+			next;
+
+		}
+		if($verbose) { print "Tree scores for tree $orfid are:\n$tree_score_string\n"; }
+		print SCORELOG "$orfid\t$tree_score_string\n";
+
+		#
+		# Create file with only the tree information that can be read by ATV
+		#
+		my $consensus_tree = create_atv_file($orfid, $consensus_file, $atv_file, $tree_type);
+
+		if (! $consensus_tree)
+		{
+			if ($verbose) { print "Error reading consensus tree: \"$atv_file\".\n";}
+			print RUNLOG "Error reading consensus tree: \"$atv_file\".\n";
+			clean_files($orfid);
+			next;
+		}
+
+		#
+		# Store the tree file to the database
+		#
+		#if (($storedb) && ($confidence > $min_score))
+		if ($storedb) 
+		{
+			if ($verbose) {print "Storing consensus tree to database...\n";}
+			if (! $dbh) {
+				print "No dbh conection, unable to store tree and scores for orf: $orfid\n";
+			} else {
+				my $tree_id = store_tree_db($orfid, $consensus_tree, $tree_type, $alignment_description, $tree_description, $dbh); 
+				if (! $tree_id) 
+				{
+					if ($verbose) { print "Error writing tree to gmoddb $gmoddb for orf# $orfid\n"; }		
+					print RUNLOG "Error writing tree to gmoddb $gmoddb for orf# $orfid\n"; 
+				}
+				store_tree_scores($tree_id, $tree_score_string, $dbh);
+			}
+		}
+	}
+
+	clean_files($orfid);
+	
+} 
+######################################
+######################################
+#
+# END MULTIORF LOOP
+#
+######################################
+######################################
+	
+
+#################################
+#
+# Prompt for cluster file name and running it
+#
+#################################
+
+if ($toclusteronly) 
+{
+	# TODO: 
+	# close (CLUSTER_RUN); 
+	if (! -f $cluster_file) 
+	{
+		if ($verbose) {print "No mrbayes run files were written.  Please check your data and try again.\n";}
+		print RUNLOG "No mrbayes run files were written.  Please check your data and try again.\n";
+	} else 
+	{
+	`chmod +x "$cluster_file"`;
+	print "Please log onto the cluster and run \"$cluster_file\" from the current directory\n\n";
+	}
+}
+
+if ($tocluster) {
+	close (ALIGNLOG);
+}
+if ($fromcluster) {
+	close (SCORELOG);
+}
+
+#######################################################################
+#######################################################################
+#
+# END OF MAIN PROGRAM
+#
+# BEGIN SUBROUTINES
+#
+#######################################################################
+#######################################################################
+
+=head1 SUBROUTINES
+
+=head2 get_hits_from_db
+
+ Title    : get_hits_from_db
+ Usage    : my $sequences_hash = get_hits_from_db(1432, "EukDB", 1e-20, $dbh);
+ Function : returns a array of hashes that contain the sequence as a Bio::Seq object (seqobj), the NCBI taxonomy id (taxid), 
+            the unique id of the sequence (seqid), and the source of the sequence (source)
+ Returns  : Array of Hashes
+ Args     : Orf id from the GMOD Database, The Blast database name, The evalue, and a database handeler to the gmoddb
+
+=cut
+
+sub get_hits_from_db
+{
+	my $orfid = shift;
+	my $blastdb = shift;
+	my $evalue = shift;
+	my $dbh = shift;
+
+	# Sequence Hash will be a reference of a hash that will contain
+	# seqobj	The sequence as a Bio::Seq object
+	# taxid		The taxonomy id
+	# genus		The genus of the organism (parsed from the description)
+	# species	The species of the organism (parsed from the description)
+	# evalue	The evalue of the hit
+	# seqid		The unique id of the sequence (either gi or accession_number)
+	# source	The source of the object (NCBI, JGI, MBL, etc)
+	# description  The description of the blast sequence (e.g., Cds2 protein, chemokine)
+
+	my $sequences_hash;
+	my $query_string = "";
+
+	# Try and find all hits to this database for this orf
+	my $sth = $dbh->prepare("select br.idname, br.evalue, br.id, br.gi, br.accession_number, br.description from blast_results br, db, sequence_type st, algorithms al
+					WHERE        
+						     br.sequence_type_id = st.id
+						AND  br.algorithm = al.id
+						AND  br.db = db.id
+						AND  st.type = 'orf'
+						AND  al.name = 'blastp'
+						AND  br.idname = ?
+						AND  db.name = ?
+						AND  br.evalue <= ?
+					ORDER BY br.evalue");
+
+	$sth->execute($orfid, $blastdb, $evalue);
+
+	my $gi_num = undef;
+	my $acc_num = undef;
+	my $seqid = undef;
+	my $seqid_long = undef;
+	my $seq = undef;
+	my $source = undef;
+	my $genus = undef;
+	my $species = undef;
+
+	my %top_hit;
+	my %genus_hash;
+	while (my $this_row = $sth->fetchrow_hashref)
+	{ 
+		my $seq_hash;
+
+		$seq_hash->{description} = $this_row->{description};
+		if ($this_row->{description} =~ /\[.*\]/) {
+			($genus, $species) = ($this_row->{description} =~ /\[(\w+) (\w+)\s*\]/);
+			$seq_hash->{genus} = $genus;
+			$seq_hash->{species} = $species;
+		}
+
+		$genus_hash{$genus}++;
+		if (($genus_hash{$genus} > $hits_per_org) && ($hits_per_org > 0) ) {
+			#already in the database, skip
+			#print "Skipping old genus: $this_row->{description}" . "\n";
+		} else {
+			if ($this_row->{gi}) { #set source and seqid from gi number
+				$gi_num = $this_row->{gi};
+				$seqid = "$gi_num" . "_" . "$genus";
+				$seq_hash->{seqid} = $seqid;
+				($seqid_long) = split /,/, $seq_hash->{description};
+				$seqid_long =~ s/\[.*\]|\(.*\)//g;
+				$seqid_long =~ s/ /_/g;
+				$seqid_long =~ s/[\;\(\),:']//g;
+				$seqid_long = substr($seqid_long,0,50);
+				$seqid_long = "$gi_num" . "_" . "$seqid_long" . "_" . "$genus";
+				$seqid_long =~ s/__/_/g; #seems to get underscore duplicate.
+				$seq_hash->{seqid_long} = $seqid_long;
+				$seq = get_seq_from_blastdb($gi_num, $blastdb);
+				$seq = Bio::Seq->new(-id=>$seqid, -seq=>$seq->seq());
+				$source = "NCBI";
+			} elsif($this_row->{accession_number}) { #set source and seqid from accession
+				$acc_num = $this_row->{accession_number};
+				$seqid = "$acc_num" . "_" . "$genus";
+				$seq_hash->{seqid_long} = $seqid;
+				$seq_hash->{seqid} = $seqid;
+				$seq = get_seq_from_blastdb($acc_num, $blastdb);
+				$seq = Bio::Seq->new(-id=>$seqid, -seq=>$seq->seq());
+				$source = $acc_num;
+				$source =~ s/^([[:alpha:]]+)\d+[[:alpha:]]+/$1/;
+			}
+			#Set other remaining hash values
+			$seq_hash->{seqobj} = $seq;
+			$seq_hash->{source} = $source;
+			$seq_hash->{evalue} = $this_row->{evalue};
+			# TODO: set seq_hash->{taxid};
+			#print "Include new genus: " . $this_row->{description} . "\n";
+
+			#check for maximum query string for $orf_seq
+			# TODO: maximum is not enough, check left and right sides for beginning and end
+			if (length($this_row->{query_string}) > length($query_string)) {
+				$query_string = $this_row->{query_string};
+			}
+
+			push(@$sequences_hash, $seq_hash);
+			#print "SeqID:" . $seq_hash->{seqid} . "  Source: " . $seq_hash->{source} . "\n and Description: " . $seq_hash->{description} . "\n";
+		}
+	}
+
+	#Add the original orf to the set of sequences for alignment, translate from nucleotide
+	my $sth = $dbh->prepare("select orfs.orfid, orfs.sequence FROM orfs WHERE orfs.orfid = ?");
+	$sth->execute($orfid);
+	my $temp_orf_seq = $sth->fetchrow_hashref->{sequence};
+	my $orf_seq = Bio::Seq->new (-seq => $temp_orf_seq, -id => $orfid);
+	$orf_seq = $orf_seq->translate();
+	my $temp_orf_hash;
+	$temp_orf_hash->{seqobj} = $orf_seq;
+	push (@$sequences_hash, $temp_orf_hash);
+
+	return $sequences_hash;
+}
+
+
+=head2 get_hits_from_blastdb
+
+ Title    : get_hits_from_blastdb
+ Usage    : my $sequences_hash = get_hits_from_blastdb($orf_seq, "EukDB", 1e-20);
+ Function : returns a array of hashes that contain the sequence as a Bio::Seq object (seqobj), the NCBI taxonomy id (taxid),
+            the unique id of the sequence (seqid), and the source of the sequence (source)
+ Returns  : Array of Hashes
+ Args     : Bio::Seq object, The Blast database name and the evalue cutoff.
+
+=cut
+
+
+sub get_hits_from_blastdb
+{
+	my $orf_seq = shift;
+	my $blastdb = shift;
+	my $evalue = shift;
+
+	# Sequence Hash will be a reference of a hash that will contain
+	# seqobj	The sequence as a Bio::Seq object
+	# taxid		The taxonomy id
+	# genus		The genus of the organism (parsed from the description)
+	# species	The species of the organism (parsed from the description)
+	# evalue	The evalue of the hit
+	# seqid		The unique id of the sequence (either gi or accession_number)
+	# seqid_long	The id with protein:  gi_proteincoded_genus
+	# source	The source of the object (NCBI, JGI, MBL, etc)
+	# description  The description of the blast sequence (e.g., Cds2 protein, chemokine)
+
+	my $sequences_hash;
+	my $seqid;
+	my $seqid_long;
+
+	# Create the blast factory object
+	
+	#my $factory = Bio::Tools::Run::StandAloneBlast->new(program=>'blastp', database=>$blastdb, I=>'T');
+	my @blast_params = (program=>'blastp', database=>$blastdb, I=>'T');
+	#if ($verbose) { push(@blast_params, 'outfile' => $outputdir . '/blastp.out')} ;
+	if ($verbose) { push(@blast_params, 'outfile' => $blast_file)} ;
+	my $factory = Bio::Tools::Run::StandAloneBlast->new(@blast_params);
+
+	my $report = $factory->blastall($orf_seq);
+	
+
+	while( my $result = $report->next_result )
+	{
+		my %genus_hash;
+		while( my $hit = $result->next_hit )
+		{
+			# Check to make sure at least one of the HSP's is less then the cutoff evalue
+			my $continue = 0;
+			while( my $hsp = $hit->next_hsp)
+			{
+				if($hsp->evalue <= $evalue)
+				{
+					$continue = 1;
+				}
+			}
+			if($continue)
+			{
+				my $seq_hash;
+		
+				$hit->name;	
+				$hit->accession;
+				$hit->description;
+				my $gi_num = undef;
+	
+				if($hit->name =~ /gi|/)
+				{
+					($gi_num) = $hit->name =~ /gi\|(\d+)/;
+				}
+	
+				my $seq = undef;
+				my $source = undef;
+				my $genus = undef;
+				my $species = undef;
+
+				# TODO:  update to taxid if no description
+				$seq_hash->{description} = $hit->description;
+				if ($hit->description =~ /\[.*\]/) {
+					($genus, $species) = ($hit->description =~ /\[(\w+) (\w+)\s*\]/);
+					$seq_hash->{genus} = $genus;
+					$seq_hash->{species} = $species;
+
+				} else {
+					# check and use taxid
+					;
+				}
+
+				#only need the first (top) hit per genus, move on to the next
+		
+				$genus_hash{$genus}++;
+				if (($genus_hash{$genus} <= $hits_per_org) || ($hits_per_org < 1) ) {
+					# include this first hit for this organism
+					#print "New genus: $genus, $hit->description\n";
+					# Get the seqid (use gi number if provided, else use accession number
+					if($gi_num) 
+					{
+						$seqid = "$gi_num" . "_" . "$genus";
+						$seq_hash->{seqid} = $seqid;
+						($seqid_long) = split /,/, $hit->description;
+						$seqid_long =~ s/\[.*\]|\(.*\)//g;
+						$seqid_long =~ s/[\;\(\),:']//g;
+						$seqid_long =~ s/ /_/g;
+						$seqid_long = substr($seqid_long,0,50);
+						$seqid_long = "$gi_num" . "_" . "$seqid_long" . "_" . "$genus";
+						$seqid_long =~ s/__/_/g; #seems to get underscore duplicate.
+						$seq_hash->{seqid_long} = $seqid_long;
+						$seq = get_seq_from_blastdb($gi_num, $blastdb);
+						$seq = Bio::Seq->new(-id=>$seqid, -seq=>$seq->seq());
+						$seq_hash->{source} = "NCBI";
+					} elsif($hit->accession)
+					{
+						$seqid = $hit->accession . "_" . "$genus";
+						$seq_hash->{seqid} = $seqid;
+						$seq_hash->{seqid_long} = $seqid;
+						$seq = get_seq_from_blastdb($hit->accession, $blastdb);
+						$seq = Bio::Seq->new(-id=>$seqid, -seq=>$seq->seq());
+						#$source = $seq_hash->{seqid};
+						$source = $hit->accession;
+						$source =~ s/^([[:alpha:]]+)\d+[[:alpha:]]+/$1/;
+						$seq_hash->{source} = $source;
+						$seq_hash->{description} = $hit->description;
+					}
+					# Set remaining values
+					# TODO: Get the taxid
+					$seq_hash->{evalue} = $hit->significance;
+					$seq_hash->{taxid};
+
+				#print "SeqID:" . $seq_hash->{seqid} . "  Source: " . $seq_hash->{source} . "\n and Description: " . $seq_hash->{description} . "\n";
+	
+					# Get the sequence object
+					$seq_hash->{seqobj} = $seq;
+					#print "Push the hash," . $seq_hash->{description} . "\n";
+					push(@$sequences_hash, $seq_hash);
+				}
+			}
+		}
+	}
+	return $sequences_hash;
+}
+
+=head2 get_hits_from_alignment
+
+ Title    : get_hits_from_alignment
+ Usage    : my $sequences_hash = get_hits_from_alignment($alignment);
+ Function : returns a array of hashes that contain the sequence as a Bio::Seq object (seqobj), the NCBI taxonomy id (taxid),
+            the unique id of the sequence (seqid), and the source of the sequence (source)
+ Returns  : Array of Hashes
+ Args     : Bio::SimpleAlign object
+
+=cut
+
+sub get_hits_from_alignment
+{
+
+	$alignment = shift;
+
+
+	# Sequence Hash will be a reference of a hash that will contain
+	# seqobj	The sequence as a Bio::Seq object
+	# taxid		The taxonomy id
+	# seqid		The unique id of the sequence (either gi or accession_number)
+	# source	The source of the object (NCBI, JGI, MBL, etc)
+	# description  The description of the blast sequence (e.g., Cds2 protein, chemokine)
+
+	my $sequences_hash;
+
+	# TODO: Get sequences from the alignment and place in the sequences_hash array
+
+	return $sequences_hash;
+}
+
+
+=head2 run_alignment
+
+ Title    : run_alignment
+ Usage    : $alignment = run_alignment($sequences);
+ Function : This function will take the sequences and return an Alignment using MUSCLE as the alignment program
+ Returns  : Bio::SimpleAlign
+ Args     : An array of hashes in which the hash has an element called seqobj that is a Bio::Seq object of the sequence to align
+
+=cut
+
+
+sub run_alignment
+{
+	# TODO: if there is already an alignment, optionally use or recreate it.
+	my $sequences = shift;
+
+	# Create array of sequences from the array of hashes
+	my $seq_array;
+	foreach my $seq_ref (@$sequences)
+	{
+		push(@$seq_array, $seq_ref->{seqobj});
+
+	}
+	# Parameters to pass to MUSCLE 
+	# Muscle.pm error, always creates outfile named for first parameter.
+	my @params;
+	if ($verbose) {
+		@params = (out => $muscle_outfile, scorefile => $muscle_scorefile, log => $muscle_logfile);
+	} else {
+		@params = (scorefile => $muscle_scorefile);
+	}
+
+	my $factory = Bio::Tools::Run::Alignment::Muscle->new( @params );
+
+	$alignment = $factory->align($seq_array);
+
+	# TODO:  $muscle->cleanup();
+	return $alignment;
+
+}
+
+
+=head2 create_tree
+
+ Title    : create_tree
+ Usage    : my $tree = create_tree($alignment, $mask);
+ Function : This function will take an alignment as input and return a hash of hashes which contains the trees created.
+ Returns  : A hash of hashes which is indexed by the generation number of the tree. The hash of hashes contains the following members:
+             gen   - The generation number of this object
+             tree  - A Bio::Tree::TreeI object
+             lnl   - Value from the .p file
+             tl    - Value from the .p file
+             alpha - Value from the .p file
+             pinvar- Value from the .p file
+ Args     : A Bio::SimpleAlign object and a reference to an array of integers that contain the mask positions of the alignment
+
+=cut
+
+
+sub create_tree
+{
+	my $orfid = shift;
+	my $alignment = shift;
+	my $mask = shift;
+
+	my $trees;
+	#print "ORFID: $orfid\n";
+	
+
+	# TODO: Check for error conditions
+
+	if ($fromcluster) 
+	{
+		# Create a hash of hashes to return which will have the contents of the .p and .t files
+		# Hash contents will be indexed by generation number
+		# Objects in the hash will be
+		# gen  - The generation number of this object
+		# tree - A Bio::Tree::TreeI object
+		# lnl
+		# tl
+		# alpha
+		# pinvar
+
+		$treeio = new Bio::TreeIO(-format=>'nexus', -file=>"$treedir/$orfid.t");
+		open(TREEFILE, "$treedir/$orfid.p");
+		my $header = <TREEFILE>;
+		while(<TREEFILE>)
+		{
+			my $line = $_;
+			chomp($line);
+			my ($gen, $lnl, $tl, $alpha, $pinvar) = split("\t", $line);
+			if($gen =~ /\d+/)
+			{
+				$trees->{$gen}->{gen} = $gen;
+				$trees->{$gen}->{lnl} = $lnl;
+				$trees->{$gen}->{tl} = $tl;
+				$trees->{$gen}->{alpha} = $alpha;
+				$trees->{$gen}->{pinvar} = $pinvar;
+			}
+	
+		}
+		while( my $cur_tree = $treeio->next_tree)
+		{
+			# Names should be rep.# where # is the generation number
+			my $gen = $cur_tree->id();
+			if($gen =~ /rep/)
+			{
+				$gen =~ s/^rep\.//;
+			}
+			$trees->{$gen}->{tree} = $cur_tree;
+		}
+		return $trees
+	}
+}
+
+
+#=head2 determine_confidence
+#
+# Title    : determine_confidence
+# Usage    : 
+# Function : 
+# Returns  : 
+# Args     : 
+#
+#=cut
+#
+#sub determine_confidence
+#{
+#	my $trees = shift;
+#	my $alignment = shift;
+#
+#	my $confidence = 0;
+#
+#	while (my $cur_tree = $treeio->next_tree)
+#	{
+#
+#	# TODO: Figure out how to find a confidence value for the tree and alignment
+#	# Test so it only does it once, will remove once confidence determinition is completed
+#		$confidence = 2;
+#	}
+#
+#	return $confidence;
+#	
+#}
+
+=head2 determine_mask
+
+ Title    : determine_mask
+ Usage    :
+ Function :
+ Returns  :
+ Args     :
+
+=cut
+
+sub determine_mask
+{
+	my $alignment = shift;
+	my $anchor_size = shift;
+	my $low_score = shift;
+	my $num_steps = shift;
+
+	my $new_mask;
+	my $position=0;
+	my %score;
+	my @anchors;
+	my %startsites;
+
+	#read in $muscle_scorefile
+	
+	if (! -f $muscle_scorefile) 
+	{
+		return (0,0);
+	}
+	open (SCOREFILE, "<$muscle_scorefile");
+	while (<SCOREFILE>)
+	{
+		#set up a hash for the score by alignment position
+		#add all scores > $anchor_size to a set of anchors
+		my $line = $_;
+		chomp($line);
+		$position++;
+		($score{$position}) = split (" ", $line, 1);
+
+		if ($score{$position} >= $anchor_size) 
+		{
+			push (@anchors, $position);
+		}
+	}
+	close (SCOREFILE);
+
+	$alignment_length = $position;
+	
+	# for each anchor, step forward and backward, and see if you get a set of 
+	# low scores with minimum length of $num_steps
+	foreach my $anchor (@anchors) {
+		my $step=0;
+		my $start=$anchor;
+
+		until (($score{$start - 1} < $low_score) && ($step > $num_steps)) {
+			if (($score{$start - 1} < $low_score) && ($score{$start - 2} < $low_score)) {
+				#two low scores in a row
+				$step++;
+			} else {
+				#start over
+				$step = 0;
+			}
+			#move over one
+			$start--;
+		}
+		$startsites{$start+10}++;
+	}
+
+	my %stopsites;
+
+	foreach my $anchor (keys %startsites) {
+		my $stop = $anchor;
+		my $step = 0;
+
+		until (($score{$stop+1} < $low_score) && ($step > $num_steps))  {
+			if (($score{$stop+1} < $low_score) && ($score{$stop+2} < $low_score)) {
+				$step++;
+			} else {
+				$step=0;
+			}
+			$stop=$stop+1;
+		}
+		$stopsites{$anchor} = $stop-10;
+	}
+
+	my @startsort = sort {$a <=> $b} (keys %stopsites);
+	#print "Anchor is $anchor_size, score cutoff is $low_score, and number of steps: $num_steps contiguous low quality position(s) allowed.\n";
+	#print "Exclude 1-";
+	#$new_mask =  "Exclude 1-";
+	$new_mask =  "1-";
+	
+	#create mask "Exclude " string, and calculate number of sequences used for tree
+	my $s;
+	foreach $s (@startsort) 
+	{
+		if ($s < $stopsites{$s}) # don't double it  e.g., 3-6 6-10, will cause error in mb
+		{ 
+			if ($stopsites{$s} < $alignment_length) 
+			{ 
+				$new_mask .= "$s " . $stopsites{$s} . "-";
+				$include_length += ($stopsites{$s} - $s - 1);
+				
+			} else # don't let it go longer than the alignment
+			{ 
+				$new_mask .= "$s";
+			}
+		}
+	}
+
+	$s = @startsort[$#startsort];
+	if ($s < $alignment_length) 
+	{ # mask ends at the end, otherwise, mask already ended
+		$new_mask .= "$alignment_length;";
+	}
+
+	if (($new_mask =~ /-$/)  && ($new_mask ne "1-"))
+	{ #Need to finish the mask, this shouldn't really happen
+		$new_mask .= "$alignment_length;";
+	} 
+	
+	if ($verbose) {print "Alignment length: $alignment_length, and uses: $include_length\n";}
+
+	return $new_mask;
+}
+
+=head2 store_alignment_db
+
+ Title    : store_alignment_db
+ Usage    : $alignment = store_alignment_db($orfid, $alignment, $format, $description, $dbh);
+ Function : This function will an alignment and store as text in the gmoddb database
+ Returns  : 0 if failed, $ma_id (row id for the alignment)
+ Args     : The orfid, the Bio::Align alignment object, alignment output format, a description and the gmoddb database filehandle
+
+=cut
+
+
+sub store_alignment_db
+{
+	my $orfid = shift;
+	my $alignment = shift;
+	my $format = shift;
+	my $description = shift;
+	my $dbh = shift;
+
+	my $aln_str; #string storing the alignment text
+	my $ma_id; #record id for the new record in ma table, for linking to ma_annotation table
+	my $out = IO::String->new(\$aln_str);
+	my $ioout = Bio::AlignIO->new(-format=>$format, -fh=>$out);
+	$ioout->write_aln($alignment);
+
+	#Find the id for any existing alignment record that will be deleted.
+	#and delete any annotations associated with them.
+	my $sth = $dbh->prepare("SELECT id FROM ma WHERE idname=$orfid AND description='$alignment_description'");
+	$sth->execute();
+	if ($sth->rows > 0) {
+		$ma_id = $sth->fetchrow_hashref->{id};
+	}
+	$sth->finish();
+
+	if ($ma_id) {
+		#Delete any previous records from the ma_annotation table
+		my $sth = $dbh->prepare("DELETE FROM ma_annotation WHERE ma_id=$ma_id");
+		$sth->execute() or return 0;
+		$sth->finish();
+		undef $ma_id;  #just in case!
+	}
+
+	#Delete any previous record before inserting new record
+	my $sth = $dbh->prepare("DELETE FROM ma WHERE idname=$orfid AND description='$description'");
+	$sth->execute() or return 0;
+	$sth->finish();
+
+	#Insert the new record
+	undef $sth;
+	my $sth = $dbh->prepare("INSERT INTO ma (idname, ma, type, description) VALUES (?, ?, ?, ?)");
+	$sth->execute($orfid, $aln_str, $format, $description) or return 0;
+	$sth->finish();
+
+	#Find the id for the alignment record
+	my $sth = $dbh->prepare("SELECT id FROM ma WHERE idname=$orfid AND description='$alignment_description'");
+	$sth->execute();
+	$ma_id = $sth->fetchrow_hashref->{id};
+	$sth->finish();
+	if (! $ma_id) {
+		return 0;
+	} else {
+		return $ma_id;
+	}
+
+}
+
+
+=head2 store_alignment_file
+
+ Title    : store_alignment_file
+ Usage    : store_alignment_file($alignment_obj, $alignment_type, $alignment_file );
+ Function : This function will write an alignment object to a file.
+ Returns  : 1 if successful, 0 if failed
+ Args     : Bio::SimpleAlign object, a file format, a file name
+
+=cut
+
+sub store_alignment_file
+{
+	my $alignment = shift;
+	my $format = shift;
+	my $file = shift;
+
+	my $out = Bio::AlignIO->new(-file=>">$file", -format=>$format);
+	$out->write_aln($alignment) or return 0;
+
+	return 1;
+}
+
+=head2 store_alignment_annotation
+
+ Title    : store_alignment_annotation
+ Usage    :
+ Function : put alignment annotations into the database
+ Returns  :
+ Args     :
+
+=cut
+
+sub store_alignment_annotation
+{
+	my $aln_id = shift;
+	my $aln_block = shift;
+	my $type = shift;
+	my $dbh = shift;
+
+	#Delete any previous record before inserting new record
+	my $sth = $dbh->prepare("DELETE FROM ma_annotation WHERE id=?");
+	$sth->execute($aln_id);
+	$sth->finish();
+
+	#Insert the new record
+	undef $sth;
+	my $sth = $dbh->prepare("INSERT INTO ma_annotation (ma_id, annotation, type) VALUES (?, ?, ?)");
+	$sth->execute($aln_id, $aln_block, $type) or return 0;
+	$sth->finish();
+	return 1;
+
+}
+
+
+=head2 store_tree_db
+
+ Title    : store_tree_db
+ Usage    : store_tree_db($orfid, $tree, $format, $alignment_description, $tree_description, $dbh);
+ Function : This function will take a tree object and store as text in the gmoddb database
+ Returns  : 1 if successful; 0 if failed
+ Args     : The orfid, the Bio::Tree tree object, format (nexus), id for the alignment in gmoddb table ma, the description, and the database filehandle 
+
+=cut
+
+sub store_tree_db
+{
+	my $orfid = shift;
+	my $tree = shift;
+	my $format = shift;
+	my $alignment_description = shift;
+	my $tree_description = shift;
+	my $dbh = shift;
+
+	my $tree_str;
+	my $tree_id;
+	my $out = IO::String->new(\$tree_str);
+	my $ioout = Bio::TreeIO->new(-format=>$format, -fh=>$out);
+	$ioout->write_tree($tree);
+	#print "TREE: $tree_str\n";
+
+	#Find the id for the alignment record
+	my $ma_query_string = "SELECT id FROM ma WHERE idname=$orfid AND description='$alignment_description'";
+	my $sth = $dbh->prepare($ma_query_string);
+	$sth->execute();
+	my $ma_id = $sth->fetchrow_hashref->{id};
+	$sth->finish();
+	if (! $ma_id) {return 0;}
+
+	#Find the id for any existing tree record that will be deleted.
+	#and delete any annotations associated with them.
+	my $sth = $dbh->prepare("SELECT id FROM tree WHERE idname=$orfid AND description='$tree_description'");
+	$sth->execute();
+	$tree_id = $sth->fetchrow_hashref->{id};
+	$sth->finish();
+
+	#Delete any previous record before inserting new record
+	undef $sth;
+	my $sth = $dbh->prepare("DELETE FROM tree_annotation WHERE tree_id=$tree_id");
+	$sth->execute();
+	$sth->finish();
+
+	#Delete any previous record before inserting new record
+	undef $sth;
+	my $sth = $dbh->prepare("DELETE FROM tree WHERE idname=$orfid AND description='$tree_description'");
+	$sth->execute();
+	$sth->finish();
+
+	#Find the id for the new alignment record
+	my $ma_query_string = "SELECT id FROM ma WHERE idname=$orfid AND description='$alignment_description'";
+	my $sth = $dbh->prepare($ma_query_string);
+	$sth->execute();
+	my $ma_id = $sth->fetchrow_hashref->{id};
+	$sth->finish();
+	if (! $ma_id) {return 0;}
+
+	#Insert the new record
+	undef $sth;
+	my $sth = $dbh->prepare("INSERT INTO tree (idname, tree, type, ma_id, description) VALUES (?, ?, ?, ?, ?)");
+	$sth->execute($orfid, $tree_str, $format, $ma_id, $tree_description) or return 0;
+	$sth->finish();
+
+	#Find the id for the tree record
+	my $sth = $dbh->prepare("SELECT id FROM tree WHERE idname=$orfid AND ma_id=$ma_id AND description='$tree_description'");
+	$sth->execute();
+	my $tree_id = $sth->fetchrow_hashref->{id};
+	$sth->finish();
+	if (! $tree_id) {
+		return 0;
+	} else {
+		return $tree_id;
+	}
+
+}
+
+
+=head2 store_tree_file
+
+ Title    : store_tree_file
+ Usage    :
+ Function :
+ Returns  :
+ Args     :
+
+=cut
+
+sub store_tree_file
+{
+	my $trees = shift;
+	my $description = shift;
+	my $file = shift;
+	my $format = shift;
+
+	# TODO: Create code to store the tree to a file
+	#my $outtree = new Bio::TreeIO( -format=>$format, -file=>">$file");
+	my $outtree = new Bio::TreeIO( -format=>$format, -file=>">$file");
+	# Iterate through the trees
+	my @gens = sort { $a <=> $b} keys %$trees;
+	foreach my $gen (@gens)
+	{
+		$outtree->write_tree($trees->{$gen}->{tree});
+		# Store the tree as an svg object also for viewing 
+		# Not sure if this is useful yet so commenting it out
+		# my $svgtree = new Bio::TreeIO( -format=>'svggraph', -file=>">$outputdir" . "/$gen.svg");
+		# $svgtree->write_tree($trees->{$gen}->{tree});
+	}
+}
+
+=head2 store_tree_scores
+
+ Title    : store_tree_scores
+ Usage    : store_tree_scores ($tree_id, $tree_scores_string, $dbh)
+ Function : put tree scores into the database
+ Returns  :
+ Args     :
+
+=cut
+
+sub store_tree_scores
+{
+	my $tree_id = shift;
+	my $score_string = shift;
+	my $dbh = shift;
+
+	#Parse the string into separate score values
+	my @lines = split (/\n/, $score_string);
+	chomp(@lines);
+	my $score_line = shift @lines;
+	my @scores = split (/,/, $score_line);
+	chomp(@scores);
+	my @score_types = qw (score_possible_tests score_tests_performed score_monophyletic score_non-monophyletic score_possible-nonmonophyletic);
+
+	#Delete any previous record before inserting new record
+	my $sth = $dbh->prepare("DELETE FROM tree_annotation WHERE id=?");
+	$sth->execute($tree_id);
+	$sth->finish();
+
+	#Insert the new record
+	undef $sth;
+	my $sth = $dbh->prepare("INSERT INTO tree_annotation (tree_id, type, annotation) VALUES (?, ?, ?)");
+
+	for (my $i = 0; $i<5; $i++)
+	{
+		$score_types[$i] =~ s/^\ //;
+		$score_types[$i] =~ s/\ $//;
+		$scores[$i] =~ s/^\ //;
+		$scores[$i] =~ s/\ $//;
+		$sth->execute($tree_id, $score_types[$i], $scores[$i]) or return 0;
+	}
+
+	#Enter the results for mono/poly-phylogeny
+	foreach my $l (@lines) 
+	{
+		chomp($l);
+		my @clades = split (/,/, $l);
+		$clades[0] =~ s/^\ //;
+		$clades[0] =~ s/\ $//;
+		$clades[1] =~ s/^\ //;
+		$clades[1] =~ s/\ $//;
+		print $clades[0] . "\n" . $clades[1] . "\n";
+		$sth->execute($tree_id, lc $clades[0], $clades[1]) or return 0;
+	}
+
+	$sth->finish();
+	return 1;
+
+}
+
+
+=head2 get_seq_from_blastdb
+
+ Title    : get_seq_from_blastdb
+ Usage    :
+ Function :
+ Returns  : Bio::Seq object
+ Args     : A search string and a blast database name.
+
+=cut
+
+sub get_seq_from_blastdb
+{
+	my $seq_search = shift;
+	my $blastdb = shift;
+
+	# Create a temporary file for fasta file
+        my ($fasta_fh, $fasta_file) = tempfile( SUFFIX => '.fasta', DIR=>$temp_dir);
+	
+        `fastacmd -d $blastdb -s $seq_search > $fasta_file`;
+        my $seqio = Bio::SeqIO->new(-file =>$fasta_file,-format=>"fasta");
+        my $seq = $seqio->next_seq();
+        if($seq)
+        {
+                `rm -f $fasta_file`;
+                return $seq;
+        } else
+        {
+                `rm -f $fasta_file`;
+                return undef;
+        }	
+
+}
+
+=head2 create_bayes_file
+
+ Title    : create_bayes_file
+ Usage    : create_bayes_file($alignment_obj, $mask);
+ Function :
+ Returns  : 0 if failed, 1 if succeeded
+ Args     : A Bio::SimpleAlign object, a reference to an array of mask values, and a file name.
+
+=cut
+
+sub create_bayes_file
+{
+	my $alignment = shift;
+	my $mask = shift;
+
+
+	my $bayesblock = '';
+	my $mccladeblock = "";
+	$bayesblock .= "begin mrbayes;\n\n";
+	$bayesblock .= "    set autoclose=yes nowarnings=yes;\n";
+
+	#Add mask, if valid mask
+	#if ($mask =~ /^Exclude .*;$/) {
+	if (length ($mask) > 2) {
+		$bayesblock .= "    Exclude $mask\n";
+	}
+
+	# Picked a small number of generations for testing. Will increase in production version
+	$bayesblock .= "    prset aamodelpr=fixed(jones);\n";
+	$bayesblock .= "    lset rates=invgamma;\n";
+	$bayesblock .= "    mcmc nruns=1 ngen=$ngens printfreq=1000 samplefreq=100 nchains=4 savebrlens=yes filename=$bayes_outfile startingtree=random;\n";
+	$bayesblock .= "    sumt filename=$bayes_outfile nruns=1 burnin=$burnin showtreeprobs=no contype=halfcompat;\n";
+	$bayesblock .= "    quit;\n\n";
+	$bayesblock .= "end;\n";
+
+	# Add blocks for McClade, PAUP and GDE
+	if (length ($mask) > 2) {
+		$mccladeblock .= "\nBEGIN SETS;\n";
+		$mccladeblock .= "    CHARSET MASK = $mask\n";
+		$mccladeblock .= "END;\n";
+		$mccladeblock .= "\nBEGIN PAUP;\n";
+		$mccladeblock .= "    EXCLUDE MASK;\n";
+		$mccladeblock .= "END;\n";
+		$mccladeblock .= "BEGIN MacClade;\n";
+		$mccladeblock .= "    Version 4.0 84;\n";
+		$mccladeblock .= "    LastModified -1089033113;\n";
+		$mccladeblock .= "    Editor 0001100111111110010001011 '1' '12' Geneva '9' '100' '1' all;\n";
+		$mccladeblock .= "    EditorFile '8';\n";
+		$mccladeblock .= "END;\n";
+	}
+
+
+	if ($verbose) {
+		print "Bayes file block:\n" . $bayesblock;
+		print "McClade file block:\n" . $mccladeblock;
+	}
+	
+	my $out = Bio::AlignIO->new( -file=>">$bayes_infile", -format=>"nexus", -show_symbols=>0, -show_endblock=>0);
+
+	$out->write_aln($alignment);
+
+	open(BAYESFILE, ">>$bayes_infile");
+	print BAYESFILE "\n" . $bayesblock;
+	close(BAYESFILE);
+
+	# Now get rid of the single quotes from the bayes file
+
+	open(BAYESFILE, $bayes_infile);
+	my $file_in = '';
+
+	while(<BAYESFILE>)
+	{
+		my $line = $_;
+		$line =~ s/\'//g;
+		$file_in .= $line;
+	}
+	close(BAYESFILE);
+	open(BAYESFILE, ">$bayes_infile");
+	print BAYESFILE $file_in;
+	close(BAYESFILE);
+
+	open(BAYESFILE, ">>$bayes_infile");
+	print BAYESFILE "\n" . $mccladeblock;
+	close(BAYESFILE);
+
+	if ($verbose) {print "Finished editing Bayes file: $bayes_infile\n";}
+	return ($bayesblock, $mccladeblock);
+
+}
+
+
+=head2 create_consensus_file
+
+ Title    : create_consensus_file
+ Usage    : create_consensus_file($alignment_obj);
+ Function :
+ Returns  : 0 if failed, 1 if succeeded
+ Args     : A Bio::SimpleAlign object and a file name.
+
+=cut
+
+sub create_consensus_file
+{
+	my $alignment = shift;
+
+	my $bayesblock = '';
+	$bayesblock .= "begin mrbayes;\n\n";
+	$bayesblock .= "    set autoclose=yes nowarnings=yes;\n";
+	$bayesblock .= "    prset aamodelpr=fixed(jones);\n";
+	$bayesblock .= "    sumt filename=$bayes_outfile nruns=1 burnin=$burnin showtreeprobs=no contype=halfcompat;\n";
+	$bayesblock .= "    quit;\n\n";
+	$bayesblock .= "end;\n";
+
+	if ($verbose) {
+		print "Bayes consensus file block:\n" . $bayesblock;
+	}
+	
+	my $out = Bio::AlignIO->new( -file=>">$bayes_infile2", -format=>"nexus", -show_symbols=>0, -show_endblock=>0);
+
+	$out->write_aln($alignment);
+
+	open(BAYESFILE, ">>$bayes_infile2");
+
+	print BAYESFILE "\n" . $bayesblock;
+	close(BAYESFILE);
+
+	# Now get rid of the single quotes from the bayes file
+
+	open(BAYESFILE, $bayes_infile2);
+	my $file_in = '';
+
+	while(<BAYESFILE>)
+	{
+		my $line = $_;
+		$line =~ s/\'//g;
+		$file_in .= $line;
+	}
+	close(BAYESFILE);
+	open(BAYESFILE, ">$bayes_infile2");
+	print BAYESFILE $file_in;
+	close(BAYESFILE);
+
+	if ($verbose) {print "Finished editing Bayes consensus file: $bayes_infile2\n";}
+	return 1;
+
+}
+
+
+=head2 write_seqids
+
+ Title    : write_seqids
+ Usage    : write_seqids($sequences_hash, $seqpm_file);
+ Function :
+ Returns  : 0 if failed, 1 if succeeded
+ Args     : A hash of sequence information, and an output file
+
+=cut
+
+sub write_seqids
+{
+	my $sequences = shift;
+	my $out_idfile = shift;
+	my $lookup_string;
+
+	open (IDFILE, ">$out_idfile") ||  return 0;
+
+	$lookup_string = "#! /usr/bin/perl -w\n\n";
+	$lookup_string .= "sub get_seqids {\n";
+	$lookup_string .= "\tmy \$seq_lookup;\n\n";
+	foreach my $seq (@$sequences)
+	{
+		my $short_id = $seq->{seqid};
+		my $long_id = $seq->{seqid_long};
+		$lookup_string .= "\t\$seq_lookup->{\"$short_id\"} = \"$long_id\";\n";
+	}
+	$lookup_string .= "\nreturn \$seq_lookup;\n";
+	$lookup_string .= "}\n";
+	print IDFILE "$lookup_string";
+	close(IDFILE);
+	return 1;
+}
+
+=head2 read_seqids
+
+ Title    : read_seqids
+ Usage    : read_seqids($seqpm_file);
+ Function :
+ Returns  : perl module file containing sequence id hash
+ Args     : an input seqid module 
+
+=cut
+
+sub read_seqids
+{
+	my $seqpm_file = shift;
+	if (! -f $seqpm_file) {return 0;}
+	my $seq_lookup;
+	do $seqpm_file;
+	$seq_lookup = get_seqids();
+	return $seq_lookup;
+}
+=head2 replace_sequenceid
+
+ Title    : replace_sequenceid
+ Usage    : replace_sequenceid($hashreference, $consensus_file);
+ Function :
+ Returns  : 0 if failed, 1 if succeeded
+ Args     : A reference to a hash that includes id information, and the consensus tree file
+
+=cut
+
+sub replace_sequenceid
+{
+	my $sequences = shift;
+	my $confile = shift;
+	my $filestring;
+	my $delim = $/;
+
+	undef $/;
+	open (SCRIPTFILE, "<$confile") || return 0;
+	$filestring =  <SCRIPTFILE>;
+	close (SCRIPTFILE);
+
+	#Tacky coding, but have two different kinds of hashes depending...
+	if ($run eq "all") {
+		foreach my $seq (@$sequences)
+		{
+			my $short_id = $seq->{seqid};
+			my $long_id = $seq->{seqid_long};
+			$filestring =~ s/$short_id/$long_id/gs;
+		}
+	} else { #is fromclusteronly
+		foreach my $seq (keys %$sequences) 
+		{
+			my $short_id = $seq;
+			my $long_id = $sequences->{$seq};
+			$filestring =~ s/$short_id/$long_id/gs;
+		}
+	}
+	open (SCRIPTFILE, ">$confile") || return 0;
+	print SCRIPTFILE $filestring;
+	close (SCRIPTFILE);
+
+	$/ = $delim;
+}
+
+=head2 create_atv_file($orfid, $atv_file)
+
+ Title    : create_atv_file
+ Usage    : create_atv_file($orfid, $atv_file);
+ Function :
+ Returns  : 0 if failed, 1 if succeeded
+ Args     : An orfid and a mrbayes consensus tree file
+
+=cut
+
+sub create_atv_file
+{
+	my $orfid = shift;
+	my $consensus_file = shift;
+	my $atv_file = shift;
+	my $tree_type = shift;
+
+	my $in = new Bio::TreeIO(-file => $consensus_file, -format => "nexus");
+	my $tree = $in->next_tree;
+
+	if (! $tree) { return 0; }
+	my $out = new Bio::TreeIO(-file => ">$atv_file", -format => $tree_type);
+	$out->write_tree($tree);
+	return $tree;
+}
+
+
+=head2 write_align_log
+
+ Title    : write_align_log
+ Usage    : write_align_log
+ Function : Write orf and alignment values to the log file
+ Returns  : 0 if failed, 1 if succeeded
+ Args     : An orfid, number of sequences, orf length, alignment length, include length, 
+
+=cut
+
+sub write_align_log
+{
+	my $id = shift;
+	print ALIGNLOG "$id\t$seq_num\t$orf_length\t$alignment_length\t$include_length\n";
+}
+
+=head2 clean_files($orfid)
+
+ Title    : clean_files
+ Usage    : clean_files($orfid);
+ Function : clean up files that are no longer necessary
+ Returns  : 0 if failed, 1 if succeeded
+ Args     : An orfid 
+
+=cut
+
+sub clean_files
+{
+	my $orfid = shift;
+
+	# Leave alone
+	#$aln_log_file;
+	#$blast_file;
+	#$muscle_scorefile;
+	#$bayes_infile1;
+	#$bayes_outfile;
+	#$cluster_file;
+	#$consensus_file;
+	#$atv_file;
+	#$treedir;
+	
+	# Delete files
+	#$muscle_logfile;
+	#$muscle_outfile;
+	#$alignment_file;
+	#$bayes_infile2;
+
+	#foreach my $f ($muscle_logfile, $muscle_outfile, $alignment_file, $bayes_infile2)
+
+	#
+	# Don't clean anything up for now, just leave it all!
+	#
+	return 1;
+
+	foreach my $f ($muscle_logfile, $muscle_outfile, $alignment_file)
+	{
+		if (-f $f) 
+		{
+			if (! ($f eq $alignment_file) && ($storefile) ) 
+			{
+				`rm $f`;
+			}
+		}
+	}
+	if ($fromcluster) 
+	{
+		if (-f $seqpm_file) 
+		{
+			`rm -f`;
+		}
+	}
+}
